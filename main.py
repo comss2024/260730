@@ -13,6 +13,7 @@
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import requests
 import streamlit as st
 
@@ -142,6 +143,50 @@ def build_time_series(df: pd.DataFrame, age_cols: list):
     )
     ts["학령인구비율"] = (ts["중학교인구"] / ts["전체인구"] * 100).round(2)
     return ts
+
+
+@st.cache_data(show_spinner="초등학생 수를 바탕으로 향후 5년 중학교 학령인구를 예측하는 중입니다...")
+def build_forecast(df: pd.DataFrame, base_year: int, horizon: int = 5):
+    """'초등학생이 그대로 나이만 먹고 진급한다'는 단순 가정으로 향후 N년의
+    13~15세(중학교) 인구를 예측한다.
+
+    예) 올해 12세인 학생은 1년 뒤 13세가 되어 중학교 학령인구에 포함된다.
+        올해 8세인 학생은 5년 뒤 13세가 되어 중학교 학령인구에 포함된다.
+    전출입·사망 등은 고려하지 않는 아주 단순한(naive) 예측이라는 점에 유의해야 한다.
+    """
+
+    # 예측에 필요한 나이는 8~14세이다.
+    # (5년 뒤 13세가 될 사람은 지금 8세, 1년 뒤 15세가 될 사람은 지금 14세)
+    needed_ages = sorted({target - d for target in (13, 14, 15) for d in range(1, horizon + 1)})
+    needed_cols = [f"계_{age}세" for age in needed_ages]
+
+    base_df = df[df["연도"] == base_year].copy()
+    base_df["시군구코드"] = base_df["코드"].str[:5]
+
+    # 시군구 단위로 나이별 인구를 합산해 둔다.
+    agg_dict = {"시도": ("시도", "first"), "시군구": ("시군구", "first")}
+    agg_dict.update({col: (col, "sum") for col in needed_cols})
+    grouped = base_df.groupby("시군구코드").agg(**agg_dict).reset_index()
+
+    # 연도(d년 후)별로 '13세+14세+15세가 될 사람 수'를 계산해서 쌓는다.
+    forecast_rows = []
+    for d in range(1, horizon + 1):
+        forecast_year = base_year + d
+        # 3개 연령(13,14,15세)을 만들 나이별 인구를 더한다.
+        중학교인구_예측 = sum(grouped[f"계_{target - d}세"] for target in (13, 14, 15))
+        forecast_rows.append(
+            pd.DataFrame(
+                {
+                    "연도": forecast_year,
+                    "시군구코드": grouped["시군구코드"],
+                    "시도": grouped["시도"],
+                    "시군구": grouped["시군구"],
+                    "중학교인구": 중학교인구_예측,
+                }
+            )
+        )
+
+    return pd.concat(forecast_rows, ignore_index=True)
 
 
 # ----------------------------------------------------------------------------
@@ -323,46 +368,100 @@ decline_df["감소율"] = (
 # 감소율이 큰 순서로 정렬해서 상위 5개 지역을 뽑는다.
 top_decline = decline_df.sort_values("감소율", ascending=False).head(5)
 
+# ----------------------------------------------------------------------------
+# 6-1. 향후 5년 예측: 초등학생(7~12세) 수를 바탕으로 미래 중학교 학령인구 추정
+# ----------------------------------------------------------------------------
+FORECAST_HORIZON = 5
+forecast_df = build_forecast(pop_df, base_year=end_year, horizon=FORECAST_HORIZON)
+
+# 예측 마지막 연도(끝인구 대비)의 감소율도 함께 계산해서 선택 상자 라벨에 보여준다.
+forecast_last = forecast_df[forecast_df["연도"] == end_year + FORECAST_HORIZON][
+    ["시군구코드", "중학교인구"]
+].rename(columns={"중학교인구": "예측인구"})
+decline_df = decline_df.merge(forecast_last, on="시군구코드", how="left")
+decline_df["예측감소율"] = np.where(
+    decline_df["끝인구"] > 0,
+    ((decline_df["끝인구"] - decline_df["예측인구"]) / decline_df["끝인구"] * 100).round(2),
+    np.nan,
+)
+
 st.markdown(
-    f"**{start_year}년 → {end_year}년** 동안 중학교 학령인구(13~15세, 명)가 "
-    "가장 많이 줄어든(감소율이 큰) 지역들의 변동 추이입니다."
+    f"**{start_year}년 → {end_year}년**(실선, 실제 자료) 동안 중학교 학령인구(13~15세, 명)가 "
+    "가장 많이 줄어든(감소율이 큰) 지역들의 변동 추이이며, "
+    f"**{end_year}년 → {end_year + FORECAST_HORIZON}년**(점선, 예측)은 "
+    "현재 초등학생(7~12세) 수가 그대로 나이만 먹고 진급한다고 가정한 단순 예측입니다. "
+    "전출입·사망 등은 반영하지 않은 참고용 수치입니다."
 )
 
 # 사용자가 비교하고 싶은 지역을 직접 골라볼 수 있도록 선택 상자를 제공한다.
-# 기본값은 감소율 상위 5개 지역으로 미리 채워둔다.
+# 기본값은 (실제) 감소율 상위 5개 지역으로 미리 채워둔다.
 all_region_options = decline_df.sort_values("감소율", ascending=False)
 option_codes = all_region_options["시군구코드"].tolist()
 option_labels = {
-    row["시군구코드"]: f"{row['시도']} {row['시군구']} (감소율 {row['감소율']}%)"
+    row["시군구코드"]: (
+        f"{row['시도']} {row['시군구']} "
+        f"(최근10년 -{row['감소율']}% / 향후5년 예측 -{row['예측감소율']}%)"
+    )
     for _, row in all_region_options.iterrows()
 }
 
 selected_codes = st.multiselect(
-    "그래프에 표시할 지역 선택 (기본값: 감소율 상위 5개 지역)",
+    "그래프에 표시할 지역 선택 (기본값: 최근 10년 감소율 상위 5개 지역)",
     options=option_codes,
     default=top_decline["시군구코드"].tolist(),
     format_func=lambda code: option_labels.get(code, code),
 )
 
 if selected_codes:
-    # 선택된 지역들의 연도별 학령인구(명) 추이만 뽑아낸다.
-    trend_df = ts_recent[ts_recent["시군구코드"].isin(selected_codes)].copy()
-    # 범례에 '시도 시군구' 형태로 표시되도록 지역명 열을 만든다.
-    trend_df["지역"] = trend_df["시도"] + " " + trend_df["시군구"]
+    # 지역마다 서로 다른 색을 지정해서, 실선(실측)과 점선(예측)이 같은 색으로 짝이 맞도록 한다.
+    palette = px.colors.qualitative.Plotly
+    color_of = {code: palette[i % len(palette)] for i, code in enumerate(selected_codes)}
 
-    trend_fig = px.line(
-        trend_df.sort_values("연도"),
-        x="연도",
-        y="중학교인구",
-        color="지역",
-        markers=True,  # 연도마다 점을 찍어서 값 변화를 눈에 띄게 표시
-        labels={"연도": "연도", "중학교인구": "중학교 학령인구(명)", "지역": "지역"},
-    )
+    trend_fig = go.Figure()
+
+    for code in selected_codes:
+        region_label = option_labels.get(code, code).split(" (")[0]  # '시도 시군구'만 사용
+        color = color_of[code]
+
+        # (1) 실선: 최근 10년 실제 데이터
+        actual = ts_recent[ts_recent["시군구코드"] == code].sort_values("연도")
+        trend_fig.add_trace(
+            go.Scatter(
+                x=actual["연도"],
+                y=actual["중학교인구"],
+                mode="lines+markers",
+                name=region_label,
+                legendgroup=code,
+                line=dict(color=color, dash="solid"),
+                hovertemplate=f"{region_label}<br>%{{x}}년(실측): %{{y:,}}명<extra></extra>",
+            )
+        )
+
+        # (2) 점선: 향후 5년 예측 데이터 (실선의 마지막 점과 이어지도록 end_year 지점을 포함)
+        future = forecast_df[forecast_df["시군구코드"] == code].sort_values("연도")
+        connect_x = [end_year] + future["연도"].tolist()
+        connect_y = [actual["중학교인구"].iloc[-1]] + future["중학교인구"].tolist()
+        trend_fig.add_trace(
+            go.Scatter(
+                x=connect_x,
+                y=connect_y,
+                mode="lines+markers",
+                name=region_label + " (예측)",
+                legendgroup=code,
+                showlegend=False,  # 범례는 실선 쪽에만 표시 (같은 색이라 구분 가능)
+                line=dict(color=color, dash="dash"),
+                marker=dict(symbol="circle-open"),
+                hovertemplate=f"{region_label}<br>%{{x}}년(예측): %{{y:,}}명<extra></extra>",
+            )
+        )
+
     trend_fig.update_layout(
-        height=450,
+        height=470,
         margin=dict(l=0, r=0, t=10, b=0),
-        legend_title_text="지역",
-        xaxis=dict(dtick=1),  # x축에 연도를 하나씩 모두 표시
+        legend_title_text="지역 (실선=실측, 점선=예측)",
+        xaxis=dict(dtick=1, title="연도"),
+        yaxis=dict(title="중학교 학령인구(명)"),
+        hovermode="closest",
     )
     st.plotly_chart(trend_fig, use_container_width=True)
 else:

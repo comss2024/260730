@@ -117,6 +117,33 @@ def make_bins(ratio_series: pd.Series):
     return edges, labels
 
 
+@st.cache_data(show_spinner="연도별 학령인구 변동 데이터를 계산하는 중입니다...")
+def build_time_series(df: pd.DataFrame, age_cols: list):
+    """모든 연도에 대해 시군구별 13~15세 인구(명)와 비율(%)을 한 번에 계산한다.
+    (최근 10년 변동 추이 그래프에 사용)"""
+
+    middle_cols = [f"계_{age}세" for age in MIDDLE_SCHOOL_AGES]
+
+    work_df = df.copy()
+    work_df["전체인구"] = work_df[age_cols].sum(axis=1)
+    work_df["중학교인구"] = work_df[middle_cols].sum(axis=1)
+    work_df["시군구코드"] = work_df["코드"].str[:5]
+
+    # '연도'와 '시군구코드' 두 기준으로 묶어서 연도별 시계열 데이터를 만든다.
+    ts = (
+        work_df.groupby(["연도", "시군구코드"])
+        .agg(
+            시도=("시도", "first"),
+            시군구=("시군구", "first"),
+            전체인구=("전체인구", "sum"),
+            중학교인구=("중학교인구", "sum"),
+        )
+        .reset_index()
+    )
+    ts["학령인구비율"] = (ts["중학교인구"] / ts["전체인구"] * 100).round(2)
+    return ts
+
+
 # ----------------------------------------------------------------------------
 # 3. 실제 데이터 로딩 & 연도 선택
 # ----------------------------------------------------------------------------
@@ -261,3 +288,82 @@ with col_right:
         bottom10.style.format({"학령인구비율": "{:.2f}%"}),
         use_container_width=True,
     )
+
+
+# ----------------------------------------------------------------------------
+# 6. 최근 10년 학령인구 감소율 상위 지역의 변동 추이 (꺾은선 그래프)
+# ----------------------------------------------------------------------------
+st.subheader("최근 10년 학령인구 감소율 TOP 지역 변동 추이")
+
+# 모든 연도의 시군구별 중학교 학령인구(명)를 한 번에 계산한다.
+ts_df = build_time_series(pop_df, age_cols)
+
+# '최근 10년' = 데이터에 있는 연도 중 가장 최근 10개 (연도가 10개보다 적으면 있는 만큼 전부 사용)
+recent_years = sorted(pop_df["연도"].unique())[-10:]
+start_year, end_year = recent_years[0], recent_years[-1]
+
+ts_recent = ts_df[ts_df["연도"].isin(recent_years)].copy()
+
+# 감소율(%) = (시작 연도 인구 - 끝 연도 인구) / 시작 연도 인구 x 100
+# 값이 클수록 그동안 학령인구가 많이 줄어든 지역이라는 뜻이다.
+start_pop = ts_recent[ts_recent["연도"] == start_year][["시군구코드", "중학교인구"]].rename(
+    columns={"중학교인구": "시작인구"}
+)
+end_pop = ts_recent[ts_recent["연도"] == end_year][
+    ["시군구코드", "시도", "시군구", "중학교인구"]
+].rename(columns={"중학교인구": "끝인구"})
+
+# 두 연도 모두에 데이터가 있는 지역만 비교한다 (예: 세종시처럼 중간에 생긴 지역은 제외).
+decline_df = end_pop.merge(start_pop, on="시군구코드", how="inner")
+decline_df = decline_df[decline_df["시작인구"] > 0]  # 0으로 나누기 방지
+decline_df["감소율"] = (
+    (decline_df["시작인구"] - decline_df["끝인구"]) / decline_df["시작인구"] * 100
+).round(2)
+
+# 감소율이 큰 순서로 정렬해서 상위 5개 지역을 뽑는다.
+top_decline = decline_df.sort_values("감소율", ascending=False).head(5)
+
+st.markdown(
+    f"**{start_year}년 → {end_year}년** 동안 중학교 학령인구(13~15세, 명)가 "
+    "가장 많이 줄어든(감소율이 큰) 지역들의 변동 추이입니다."
+)
+
+# 사용자가 비교하고 싶은 지역을 직접 골라볼 수 있도록 선택 상자를 제공한다.
+# 기본값은 감소율 상위 5개 지역으로 미리 채워둔다.
+all_region_options = decline_df.sort_values("감소율", ascending=False)
+option_codes = all_region_options["시군구코드"].tolist()
+option_labels = {
+    row["시군구코드"]: f"{row['시도']} {row['시군구']} (감소율 {row['감소율']}%)"
+    for _, row in all_region_options.iterrows()
+}
+
+selected_codes = st.multiselect(
+    "그래프에 표시할 지역 선택 (기본값: 감소율 상위 5개 지역)",
+    options=option_codes,
+    default=top_decline["시군구코드"].tolist(),
+    format_func=lambda code: option_labels.get(code, code),
+)
+
+if selected_codes:
+    # 선택된 지역들의 연도별 학령인구(명) 추이만 뽑아낸다.
+    trend_df = ts_recent[ts_recent["시군구코드"].isin(selected_codes)].copy()
+    # 범례에 '시도 시군구' 형태로 표시되도록 지역명 열을 만든다.
+    trend_df["지역"] = trend_df["시도"] + " " + trend_df["시군구"]
+
+    trend_fig = px.line(
+        trend_df.sort_values("연도"),
+        x="연도",
+        y="중학교인구",
+        color="지역",
+        markers=True,  # 연도마다 점을 찍어서 값 변화를 눈에 띄게 표시
+        labels={"연도": "연도", "중학교인구": "중학교 학령인구(명)", "지역": "지역"},
+    )
+    trend_fig.update_layout(
+        height=450,
+        margin=dict(l=0, r=0, t=10, b=0),
+        legend_title_text="지역",
+        xaxis=dict(dtick=1),  # x축에 연도를 하나씩 모두 표시
+    )
+    st.plotly_chart(trend_fig, use_container_width=True)
+else:
+    st.info("비교할 지역을 하나 이상 선택해 주세요.")

@@ -1,4 +1,4 @@
 import streamlit as st
-st.title("나의 첫 웹앱에 오신 것을 환영합니다!")
-st.write("by 장현주😊")
 
+st.title("첫 배포 확인 👋")
+st.write("여기까지 보이면 배포 성공입니다.")

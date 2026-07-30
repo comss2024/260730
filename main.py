@@ -1,13 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-전국 고령화 지도 (시군구별 65세 이상 인구 비율 단계구분도)
+전국 학령인구 지도 (시군구별 13~15세 중학교 학령인구 비율 단계구분도)
 - 인구 데이터: 읍·면·동 단위 연도별 인구 (2015~2026)
 - 경계 데이터: 전국 시군구 255개 GeoJSON
 - '코드' 앞 5자리로 시군구를 구분하여 두 데이터를 연결한다.
+
+※ 참고: 5단계 구간 경계값은 '13~15세 인구 비율'의 실제 분포를 5등분(20/40/60/80
+  백분위수)해서 계산한 값이다. (65세 이상 고령화율용 경계값과는 지표 자체가
+  다르므로 그대로 쓸 수 없어 새로 계산했다.)
 """
 
-import re
-
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import requests
@@ -16,18 +19,18 @@ import streamlit as st
 # ----------------------------------------------------------------------------
 # 0. 기본 설정
 # ----------------------------------------------------------------------------
-st.set_page_config(page_title="전국 고령화 지도", layout="wide")
+st.set_page_config(page_title="전국 중학교 학령인구 지도", layout="wide")
 
 POP_URL = "https://raw.githubusercontent.com/greatsong/modudata/main/data/population_yearly.csv.gz"
 GEO_URL = "https://raw.githubusercontent.com/greatsong/modudata/main/data/boundaries/sigungu_kr.geojson"
 
-# 5단계 구간 경계값 (전국 시군구를 다섯 덩어리로 나눈 실제 값)
-BIN_EDGES = [-0.01, 19, 23, 28, 38, 100]
-BIN_LABELS = ["19% 미만", "19% ~ 23%", "23% ~ 28%", "28% ~ 38%", "38% 이상"]
+# 중학교 학령인구(13~15세)에 해당하는 나이 범위
+MIDDLE_SCHOOL_AGES = range(13, 16)  # 13세, 14세, 15세
 
-# 옅은 색 -> 진한 색 순서 (파란 계열 5단계)
-BIN_COLORS = ["#eff3ff", "#bdd7e7", "#6baed6", "#3182bd", "#08519c"]
-COLOR_MAP = dict(zip(BIN_LABELS, BIN_COLORS))
+# 5단계 구간 경계값
+# (전국 시군구의 '13~15세 인구 비율'을 실제로 5등분한 값. 아래 build_ratio 함수에서
+#  매번 새로 계산해서 쓰기 때문에, 연도가 바뀌어도 항상 실제 분포에 맞는 경계값이 된다.)
+BIN_COLORS = ["#eff3ff", "#bdd7e7", "#6baed6", "#3182bd", "#08519c"]  # 옅은색 -> 진한색
 
 
 # ----------------------------------------------------------------------------
@@ -62,27 +65,21 @@ def load_geojson():
     return res.json()
 
 
-def parse_age(col_name: str) -> int:
-    """'계_0세', '계_65세', '계_100세 이상' 같은 열 이름에서 나이를 숫자로 뽑아낸다."""
-    match = re.search(r"(\d+)", col_name)
-    return int(match.group(1)) if match else 0
-
-
 # ----------------------------------------------------------------------------
-# 2. 시군구 단위로 65세 이상 인구 비율 계산
+# 2. 시군구 단위로 13~15세(중학교) 학령인구 비율 계산
 # ----------------------------------------------------------------------------
-@st.cache_data(show_spinner="시군구별 고령화율을 계산하는 중입니다...")
+@st.cache_data(show_spinner="시군구별 중학교 학령인구 비율을 계산하는 중입니다...")
 def build_sigungu_ratio(df: pd.DataFrame, age_cols: list, target_year: int):
-    """읍·면·동 인구를 시군구 단위로 합쳐서 65세 이상 인구 비율(%)을 구한다."""
+    """읍·면·동 인구를 시군구 단위로 합쳐서 13~15세 인구 비율(%)을 구한다."""
 
-    # 65세 이상에 해당하는 나이별 열만 골라낸다.
-    elderly_cols = [c for c in age_cols if parse_age(c) >= 65]
+    # 13~15세(중학교)에 해당하는 나이별 열만 골라낸다. 예: '계_13세','계_14세','계_15세'
+    middle_cols = [f"계_{age}세" for age in MIDDLE_SCHOOL_AGES]
 
     year_df = df[df["연도"] == target_year].copy()
 
-    # 전체 인구, 65세 이상 인구를 읍·면·동 단위로 먼저 계산한다.
+    # 전체 인구, 13~15세 인구를 읍·면·동 단위로 먼저 계산한다.
     year_df["전체인구"] = year_df[age_cols].sum(axis=1)
-    year_df["고령인구"] = year_df[elderly_cols].sum(axis=1)
+    year_df["중학교인구"] = year_df[middle_cols].sum(axis=1)
 
     # '코드' 앞 5자리 = 시군구 코드
     year_df["시군구코드"] = year_df["코드"].str[:5]
@@ -94,19 +91,30 @@ def build_sigungu_ratio(df: pd.DataFrame, age_cols: list, target_year: int):
             시도=("시도", "first"),
             시군구=("시군구", "first"),
             전체인구=("전체인구", "sum"),
-            고령인구=("고령인구", "sum"),
+            중학교인구=("중학교인구", "sum"),
         )
         .reset_index()
     )
 
-    grouped["고령화율"] = (grouped["고령인구"] / grouped["전체인구"] * 100).round(2)
-
-    # 5단계 구간으로 나누어 범례용 문자열 열을 만든다.
-    grouped["구간"] = pd.cut(
-        grouped["고령화율"], bins=BIN_EDGES, labels=BIN_LABELS
-    )
+    grouped["학령인구비율"] = (
+        grouped["중학교인구"] / grouped["전체인구"] * 100
+    ).round(2)
 
     return grouped
+
+
+def make_bins(ratio_series: pd.Series):
+    """비율 값의 실제 분포를 5등분(20/40/60/80 백분위수)한 경계값과 구간 라벨을 만든다."""
+    q20, q40, q60, q80 = np.percentile(ratio_series.dropna(), [20, 40, 60, 80])
+    edges = [-0.01, round(q20, 2), round(q40, 2), round(q60, 2), round(q80, 2), 100]
+    labels = [
+        f"{edges[1]}% 미만",
+        f"{edges[1]}% ~ {edges[2]}%",
+        f"{edges[2]}% ~ {edges[3]}%",
+        f"{edges[3]}% ~ {edges[4]}%",
+        f"{edges[4]}% 이상",
+    ]
+    return edges, labels
 
 
 # ----------------------------------------------------------------------------
@@ -117,6 +125,14 @@ geojson = load_geojson()
 
 latest_year = int(pop_df["연도"].max())
 ratio_df = build_sigungu_ratio(pop_df, age_cols, latest_year)
+
+# 실제 분포를 기준으로 5단계 구간 경계값과 라벨을 만든다.
+bin_edges, bin_labels = make_bins(ratio_df["학령인구비율"])
+color_map = dict(zip(bin_labels, BIN_COLORS))
+
+ratio_df["구간"] = pd.cut(
+    ratio_df["학령인구비율"], bins=bin_edges, labels=bin_labels
+)
 
 # GeoJSON에 있는 시군구 코드 목록(255개)을 기준으로 왼쪽 조인한다.
 # -> 경계는 있는데 인구 데이터가 없는 지역도 지도에는 빠짐없이 표시하기 위함.
@@ -141,13 +157,15 @@ map_df["구간"] = map_df["구간"].astype(object).where(map_df["구간"].notna(
 # ----------------------------------------------------------------------------
 # 4. 화면 구성
 # ----------------------------------------------------------------------------
-st.title("🇰🇷 전국 고령화 지도")
-st.markdown(f"**{latest_year}년** 기준, 시군구별 **65세 이상 인구 비율(고령화율)** 단계구분도입니다.")
+st.title("🏫 전국 중학교 학령인구 지도")
+st.markdown(
+    f"**{latest_year}년** 기준, 시군구별 **13~15세(중학교) 학령인구 비율**(전체 인구 대비 %) 단계구분도입니다."
+)
 
 # 색상 매핑에 '데이터 없음'을 회색으로 추가
-color_map_full = dict(COLOR_MAP)
+color_map_full = dict(color_map)
 color_map_full["데이터 없음"] = "#e0e0e0"
-category_order = BIN_LABELS + ["데이터 없음"]
+category_order = bin_labels + ["데이터 없음"]
 
 fig = px.choropleth(
     map_df,
@@ -160,11 +178,15 @@ fig = px.choropleth(
     hover_name="시군구",
     hover_data={
         "시도": True,
-        "고령화율": ":.2f",
+        "학령인구비율": ":.2f",
         "시군구코드": False,
         "구간": False,
     },
-    labels={"구간": "고령화율 구간", "고령화율": "고령화율(%)", "시도": "시도"},
+    labels={
+        "구간": "학령인구 비율 구간",
+        "학령인구비율": "중학교 학령인구 비율(%)",
+        "시도": "시도",
+    },
 )
 
 # 배경 지도 타일 없이 경계선만 보이도록 설정
@@ -179,31 +201,31 @@ fig.update_traces(marker_line_color="white", marker_line_width=0.6)
 fig.update_layout(
     height=750,
     margin=dict(l=0, r=0, t=10, b=0),
-    legend_title_text="고령화율 구간",
+    legend_title_text="학령인구 비율 구간",
 )
 
 st.plotly_chart(fig, use_container_width=True)
 
-st.caption("지도에 마우스를 올리면 시군구 이름·시도·고령화율을 확인할 수 있습니다.")
+st.caption("지도에 마우스를 올리면 시군구 이름·시도·중학교 학령인구 비율(%)을 확인할 수 있습니다.")
 
 # ----------------------------------------------------------------------------
-# 5. 고령화율 상위 10 / 하위 10 표
+# 5. 학령인구 비율 상위 10 / 하위 10 표
 # ----------------------------------------------------------------------------
-st.subheader("고령화율 상위 10 / 하위 10")
+st.subheader("중학교 학령인구 비율 상위 10 / 하위 10")
 
 # 실제 값이 있는 지역만 순위에 사용 (데이터 없음 제외)
-valid_df = ratio_df.dropna(subset=["고령화율"])
+valid_df = ratio_df.dropna(subset=["학령인구비율"])
 
 top10 = (
-    valid_df.sort_values("고령화율", ascending=False)
-    .head(10)[["시도", "시군구", "고령화율"]]
+    valid_df.sort_values("학령인구비율", ascending=False)
+    .head(10)[["시도", "시군구", "학령인구비율"]]
     .reset_index(drop=True)
 )
 top10.index = top10.index + 1
 
 bottom10 = (
-    valid_df.sort_values("고령화율", ascending=True)
-    .head(10)[["시도", "시군구", "고령화율"]]
+    valid_df.sort_values("학령인구비율", ascending=True)
+    .head(10)[["시도", "시군구", "학령인구비율"]]
     .reset_index(drop=True)
 )
 bottom10.index = bottom10.index + 1
@@ -211,15 +233,15 @@ bottom10.index = bottom10.index + 1
 col_left, col_right = st.columns(2)
 
 with col_left:
-    st.markdown("**🔺 고령화율 높은 지역 Top 10**")
+    st.markdown("**🔺 중학교 학령인구 비율 높은 지역 Top 10**")
     st.dataframe(
-        top10.style.format({"고령화율": "{:.2f}%"}),
+        top10.style.format({"학령인구비율": "{:.2f}%"}),
         use_container_width=True,
     )
 
 with col_right:
-    st.markdown("**🔻 고령화율 낮은 지역 Top 10**")
+    st.markdown("**🔻 중학교 학령인구 비율 낮은 지역 Top 10**")
     st.dataframe(
-        bottom10.style.format({"고령화율": "{:.2f}%"}),
+        bottom10.style.format({"학령인구비율": "{:.2f}%"}),
         use_container_width=True,
     )

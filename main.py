@@ -118,13 +118,25 @@ def make_bins(ratio_series: pd.Series):
 
 
 # ----------------------------------------------------------------------------
-# 3. 실제 데이터 로딩 & 계산 실행
+# 3. 실제 데이터 로딩 & 연도 선택
 # ----------------------------------------------------------------------------
 pop_df, age_cols = load_population()
 geojson = load_geojson()
 
-latest_year = int(pop_df["연도"].max())
-ratio_df = build_sigungu_ratio(pop_df, age_cols, latest_year)
+# 데이터에 있는 모든 연도를 최신순으로 나열한다.
+available_years = sorted(pop_df["연도"].unique(), reverse=True)
+latest_year = available_years[0]
+
+# 사이드바에 연도 선택 상자를 둔다. 기본값은 가장 최신 연도.
+st.sidebar.header("🔎 조회 조건")
+selected_year = st.sidebar.selectbox(
+    "조회할 연도를 선택하세요",
+    options=available_years,
+    index=0,  # available_years[0] = 최신 연도
+)
+
+# 선택한 연도를 기준으로 시군구별 학령인구 비율을 계산한다.
+ratio_df = build_sigungu_ratio(pop_df, age_cols, selected_year)
 
 # 실제 분포를 기준으로 5단계 구간 경계값과 라벨을 만든다.
 bin_edges, bin_labels = make_bins(ratio_df["학령인구비율"])
@@ -159,7 +171,7 @@ map_df["구간"] = map_df["구간"].astype(object).where(map_df["구간"].notna(
 # ----------------------------------------------------------------------------
 st.title("🏫 전국 중학교 학령인구 지도")
 st.markdown(
-    f"**{latest_year}년** 기준, 시군구별 **13~15세(중학교) 학령인구 비율**(전체 인구 대비 %) 단계구분도입니다."
+    f"**{selected_year}년** 기준, 시군구별 **13~15세(중학교) 학령인구 비율**(전체 인구 대비 %) 단계구분도입니다."
 )
 
 # 색상 매핑에 '데이터 없음'을 회색으로 추가
@@ -206,12 +218,16 @@ fig.update_layout(
 
 st.plotly_chart(fig, use_container_width=True)
 
-st.caption("지도에 마우스를 올리면 시군구 이름·시도·중학교 학령인구 비율(%)을 확인할 수 있습니다.")
+st.caption(
+    "지도에 마우스를 올리면 시군구 이름·시도·중학교 학령인구 비율(%)을 확인할 수 있습니다.  \n"
+    f"※ 5단계 구간 경계값은 {selected_year}년 실제 분포를 5등분한 값이라, 연도를 바꾸면 경계값도 함께 바뀝니다. "
+    f"(현재 경계값: {bin_edges[1]}% · {bin_edges[2]}% · {bin_edges[3]}% · {bin_edges[4]}%)"
+)
 
 # ----------------------------------------------------------------------------
 # 5. 학령인구 비율 상위 10 / 하위 10 표
 # ----------------------------------------------------------------------------
-st.subheader("중학교 학령인구 비율 상위 10 / 하위 10")
+st.subheader(f"{selected_year}년 중학교 학령인구 비율 상위 10 / 하위 10")
 
 # 실제 값이 있는 지역만 순위에 사용 (데이터 없음 제외)
 valid_df = ratio_df.dropna(subset=["학령인구비율"])
